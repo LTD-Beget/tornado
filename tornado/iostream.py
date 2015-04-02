@@ -1186,12 +1186,12 @@ class IOStream(BaseIOStream):
             try:
                 self.socket.setsockopt(socket.IPPROTO_TCP,
                                        socket.TCP_NODELAY, 1 if value else 0)
-            except socket.error as e:
+            except Exception as e:
                 # Sometimes setsockopt will fail if the socket is closed
                 # at the wrong time.  This can happen with HTTPServer
                 # resetting the value to false between requests.
                 if e.errno != errno.EINVAL and not self._is_connreset(e):
-                    raise
+                    pass # raise
 
 
 class SSLIOStream(IOStream):
@@ -1508,6 +1508,8 @@ def _merge_prefix(deque, size):
     >>> _merge_prefix(d, 100); print(d)
     deque(['abcdefghij'])
     """
+    if deque is None or deque[0] is None:
+        return
     if len(deque) == 1 and len(deque[0]) <= size:
         return
     prefix = []
