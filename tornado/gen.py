@@ -80,8 +80,8 @@ import collections
 import functools
 import itertools
 import sys
+import textwrap
 import types
-import weakref
 
 from tornado.concurrent import Future, TracebackFuture, is_future, chain_future
 from tornado.ioloop import IOLoop
@@ -96,6 +96,26 @@ except ImportError as e:
         from singledispatch import singledispatch  # backport
     except ImportError:
         singledispatch = None
+
+
+try:
+    from collections.abc import Generator as GeneratorType  # py35+
+except ImportError:
+    try:
+        from collections import Generator as GeneratorType  # py2 with backports_abc
+    except ImportError:
+        from types import GeneratorType
+
+try:
+    from inspect import isawaitable  # py35+
+except ImportError:
+    def isawaitable(x):
+        return False
+
+try:
+    import builtins  # py3
+except ImportError:
+    import __builtin__ as builtins
 
 
 class KeyReuseError(Exception):
@@ -120,6 +140,21 @@ class ReturnValueIgnoredError(Exception):
 
 class TimeoutError(Exception):
     """Exception raised by ``with_timeout``."""
+
+
+def _value_from_stopiteration(e):
+    try:
+        # StopIteration has a value attribute beginning in py33.
+        # So does our Return class.
+        return e.value
+    except AttributeError:
+        pass
+    try:
+        # Cython backports coroutine functionality by putting the value in
+        # e.args[0].
+        return e.args[0]
+    except (AttributeError, IndexError):
+        return None
 
 
 def engine(func):
@@ -202,6 +237,11 @@ def _make_coroutine_wrapper(func, replace_callback):
     argument, so we cannot simply implement ``@engine`` in terms of
     ``@coroutine``.
     """
+    # On Python 3.5, set the coroutine flag on our generator, to allow it
+    # to be used with 'await'.
+    if hasattr(types, 'coroutine'):
+        func = types.coroutine(func)
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         future = TracebackFuture()
@@ -214,12 +254,12 @@ def _make_coroutine_wrapper(func, replace_callback):
         try:
             result = func(*args, **kwargs)
         except (Return, StopIteration) as e:
-            result = getattr(e, 'value', None)
+            result = _value_from_stopiteration(e)
         except Exception:
             future.set_exc_info(sys.exc_info())
             return future
         else:
-            if isinstance(result, types.GeneratorType):
+            if isinstance(result, GeneratorType):
                 # Inline the first iteration of Runner.run.  This lets us
                 # avoid the cost of creating a Runner when the coroutine
                 # never actually yields, which in turn allows us to
@@ -235,7 +275,7 @@ def _make_coroutine_wrapper(func, replace_callback):
                                 'stack_context inconsistency (probably caused '
                                 'by yield within a "with StackContext" block)'))
                 except (StopIteration, Return) as e:
-                    future.set_result(getattr(e, 'value', None))
+                    future.set_result(_value_from_stopiteration(e))
                 except Exception:
                     future.set_exc_info(sys.exc_info())
                 else:
@@ -280,6 +320,8 @@ class Return(Exception):
     def __init__(self, value=None):
         super(Return, self).__init__()
         self.value = value
+        # Cython recognizes subclasses of StopIteration with a .args tuple.
+        self.args = (value,)
 
 
 class WaitIterator(object):
@@ -305,7 +347,7 @@ class WaitIterator(object):
           except Exception as e:
               print("Error {} from {}".format(e, wait_iterator.current_future))
           else:
-              print("Result {} recieved from {} at {}".format(
+              print("Result {} received from {} at {}".format(
                   result, wait_iterator.current_future,
                   wait_iterator.current_index))
 
@@ -318,7 +360,22 @@ class WaitIterator(object):
     arguments were used in the construction of the `WaitIterator`,
     ``current_index`` will use the corresponding keyword).
 
+    On Python 3.5, `WaitIterator` implements the async iterator
+    protocol, so it can be used with the ``async for`` statement (note
+    that in this version the entire iteration is aborted if any value
+    raises an exception, while the previous example can continue past
+    individual errors)::
+
+      async for result in gen.WaitIterator(future1, future2):
+          print("Result {} received from {} at {}".format(
+              result, wait_iterator.current_future,
+              wait_iterator.current_index))
+
     .. versionadded:: 4.1
+
+    .. versionchanged:: 4.3
+       Added ``async for`` support in Python 3.5.
+
     """
     def __init__(self, *args, **kwargs):
         if args and kwargs:
@@ -336,10 +393,8 @@ class WaitIterator(object):
         self.current_index = self.current_future = None
         self._running_future = None
 
-        self_ref = weakref.ref(self)
         for future in futures:
-            future.add_done_callback(functools.partial(
-                self._done_callback, self_ref))
+            future.add_done_callback(self._done_callback)
 
     def done(self):
         """Returns True if this iterator has no more results."""
@@ -362,14 +417,11 @@ class WaitIterator(object):
 
         return self._running_future
 
-    @staticmethod
-    def _done_callback(self_ref, done):
-        self = self_ref()
-        if self is not None:
-            if self._running_future and not self._running_future.done():
-                self._return_result(done)
-            else:
-                self._finished.append(done)
+    def _done_callback(self, done):
+        if self._running_future and not self._running_future.done():
+            self._return_result(done)
+        else:
+            self._finished.append(done)
 
     def _return_result(self, done):
         """Called set the returned future's state that of the future
@@ -379,6 +431,16 @@ class WaitIterator(object):
 
         self.current_future = done
         self.current_index = self._unfinished.pop(done)
+
+    @coroutine
+    def __aiter__(self):
+        raise Return(self)
+
+    def __anext__(self):
+        if self.done():
+            # Lookup by name to silence pyflakes on older versions.
+            raise getattr(builtins, 'StopAsyncIteration')()
+        return self.next()
 
 
 class YieldPoint(object):
@@ -614,11 +676,12 @@ class Multi(YieldPoint):
 def multi_future(children, quiet_exceptions=()):
     """Wait for multiple asynchronous futures in parallel.
 
-    Takes a list of ``Futures`` (but *not* other ``YieldPoints``) and returns
-    a new Future that resolves when all the other Futures are done.
-    If all the ``Futures`` succeeded, the returned Future's result is a list
-    of their results.  If any failed, the returned Future raises the exception
-    of the first one to fail.
+    Takes a list of ``Futures`` or other yieldable objects (with the
+    exception of the legacy `.YieldPoint` interfaces) and returns a
+    new Future that resolves when all the other Futures are done. If
+    all the ``Futures`` succeeded, the returned Future's result is a
+    list of their results. If any failed, the returned Future raises
+    the exception of the first one to fail.
 
     Instead of a list, the argument may also be a dictionary whose values are
     Futures, in which case a parallel dictionary is returned mapping the same
@@ -626,7 +689,7 @@ def multi_future(children, quiet_exceptions=()):
 
     It is not normally necessary to call `multi_future` explcitly,
     since the engine will do so automatically when the generator
-    yields a list of `Futures`. However, calling it directly
+    yields a list of ``Futures``. However, calling it directly
     allows you to use the ``quiet_exceptions`` argument to control
     the logging of multiple exceptions.
 
@@ -639,12 +702,16 @@ def multi_future(children, quiet_exceptions=()):
        If multiple ``Futures`` fail, any exceptions after the first (which is
        raised) will be logged. Added the ``quiet_exceptions``
        argument to suppress this logging for selected exception types.
+
+    .. versionchanged:: 4.3
+       Added support for other yieldable objects.
     """
     if isinstance(children, dict):
         keys = list(children.keys())
         children = children.values()
     else:
         keys = None
+    children = list(map(convert_yielded, children))
     assert all(is_future(i) for i in children)
     unfinished_children = set(children)
 
@@ -671,8 +738,12 @@ def multi_future(children, quiet_exceptions=()):
                     future.set_result(dict(zip(keys, result_list)))
                 else:
                     future.set_result(result_list)
+
+    listening = set()
     for f in children:
-        f.add_done_callback(callback)
+        if f not in listening:
+            listening.add(f)
+            f.add_done_callback(callback)
     return future
 
 
@@ -895,7 +966,7 @@ class Runner(object):
                         raise LeakedCallbackError(
                             "finished without waiting for callbacks %r" %
                             self.pending_callbacks)
-                    self.result_future.set_result(getattr(e, 'value', None))
+                    self.result_future.set_result(_value_from_stopiteration(e))
                     self.result_future = None
                     self._deactivate_stack_context()
                     return
@@ -1002,6 +1073,62 @@ def _argument_adapter(callback):
             callback(None)
     return wrapper
 
+if sys.version_info >= (3, 3):
+    exec(textwrap.dedent("""
+    @coroutine
+    def _wrap_awaitable(x):
+        if hasattr(x, '__await__'):
+            x = x.__await__()
+        return (yield from x)
+    """))
+else:
+    # Py2-compatible version for use with Cython.
+    # Copied from PEP 380.
+    @coroutine
+    def _wrap_awaitable(x):
+        if hasattr(x, '__await__'):
+            _i = x.__await__()
+        else:
+            _i = iter(x)
+        try:
+            _y = next(_i)
+        except StopIteration as _e:
+            _r = _value_from_stopiteration(_e)
+        else:
+            while 1:
+                try:
+                    _s = yield _y
+                except GeneratorExit as _e:
+                    try:
+                        _m = _i.close
+                    except AttributeError:
+                        pass
+                    else:
+                        _m()
+                    raise _e
+                except BaseException as _e:
+                    _x = sys.exc_info()
+                    try:
+                        _m = _i.throw
+                    except AttributeError:
+                        raise _e
+                    else:
+                        try:
+                            _y = _m(*_x)
+                        except StopIteration as _e:
+                            _r = _value_from_stopiteration(_e)
+                            break
+                else:
+                    try:
+                        if _s is None:
+                            _y = next(_i)
+                        else:
+                            _y = _i.send(_s)
+                    except StopIteration as _e:
+                        _r = _value_from_stopiteration(_e)
+                        break
+        raise Return(_r)
+
 
 def convert_yielded(yielded):
     """Convert a yielded object into a `.Future`.
@@ -1023,6 +1150,8 @@ def convert_yielded(yielded):
         return multi_future(yielded)
     elif is_future(yielded):
         return yielded
+    elif isawaitable(yielded):
+        return _wrap_awaitable(yielded)
     else:
         raise BadYieldError("yielded unknown object %r" % (yielded,))
 

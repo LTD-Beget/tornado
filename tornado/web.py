@@ -139,18 +139,17 @@ May be overridden by passing a ``version`` keyword argument.
 DEFAULT_SIGNED_VALUE_MIN_VERSION = 1
 """The oldest signed value accepted by `.RequestHandler.get_secure_cookie`.
 
-May be overrided by passing a ``min_version`` keyword argument.
+May be overridden by passing a ``min_version`` keyword argument.
 
 .. versionadded:: 3.2.1
 """
 
 
 class RequestHandler(object):
-    """Subclass this class and define `get()` or `post()` to make a handler.
+    """Base class for HTTP request handlers.
 
-    If you want to support more methods than the standard GET/HEAD/POST, you
-    should override the class variable ``SUPPORTED_METHODS`` in your
-    `RequestHandler` subclass.
+    Subclasses must define at least one of the methods defined in the
+    "Entry points" section below.
     """
     SUPPORTED_METHODS = ("GET", "HEAD", "POST", "DELETE", "PATCH", "PUT",
                          "OPTIONS")
@@ -363,10 +362,8 @@ class RequestHandler(object):
         else:
             raise TypeError("Unsupported header value %r" % value)
         # If \n is allowed into the header, it is possible to inject
-        # additional headers or split the request. Also cap length to
-        # prevent obviously erroneous values.
-        if (len(value) > 4000 or
-                RequestHandler._INVALID_HEADER_CHAR_RE.search(value)):
+        # additional headers or split the request.
+        if RequestHandler._INVALID_HEADER_CHAR_RE.search(value):
             raise ValueError("Unsafe header value %r", value)
         return value
 
@@ -613,8 +610,15 @@ class RequestHandler(object):
            and made it the default.
         """
         self.require_setting("cookie_secret", "secure cookies")
-        return create_signed_value(self.application.settings["cookie_secret"],
-                                   name, value, version=version)
+        secret = self.application.settings["cookie_secret"]
+        key_version = None
+        if isinstance(secret, dict):
+            if self.application.settings.get("key_version") is None:
+                raise Exception("key_version setting must be used for secret_key dicts")
+            key_version = self.application.settings["key_version"]
+
+        return create_signed_value(secret, name, value, version=version,
+                                   key_version=key_version)
 
     def get_secure_cookie(self, name, value=None, max_age_days=31,
                           min_version=None):
@@ -634,6 +638,16 @@ class RequestHandler(object):
         return decode_signed_value(self.application.settings["cookie_secret"],
                                    name, value, max_age_days=max_age_days,
                                    min_version=min_version)
+
+    def get_secure_cookie_key_version(self, name, value=None):
+        """Returns the signing key version of the secure cookie.
+
+        The version is returned as int.
+        """
+        self.require_setting("cookie_secret", "secure cookies")
+        if value is None:
+            value = self.get_cookie(name)
+        return get_signature_key_version(value)
 
     def redirect(self, url, permanent=False, status=None):
         """Sends a redirect to the given (optionally relative) URL.
@@ -821,8 +835,9 @@ class RequestHandler(object):
 
         May be overridden by subclasses.  By default returns a
         directory-based loader on the given path, using the
-        ``autoescape`` application setting.  If a ``template_loader``
-        application setting is supplied, uses that instead.
+        ``autoescape`` and ``template_whitespace`` application
+        settings.  If a ``template_loader`` application setting is
+        supplied, uses that instead.
         """
         settings = self.application.settings
         if "template_loader" in settings:
@@ -832,6 +847,8 @@ class RequestHandler(object):
             # autoescape=None means "no escaping", so we have to be sure
             # to only pass this kwarg if the user asked for it.
             kwargs["autoescape"] = settings["autoescape"]
+        if "template_whitespace" in settings:
+            kwargs["whitespace"] = settings["template_whitespace"]
         return template.Loader(template_path, **kwargs)
 
     def flush(self, include_footers=False, callback=None):
@@ -1371,10 +1388,8 @@ class RequestHandler(object):
                 self.check_xsrf_cookie()
 
             result = self.prepare()
-            if is_future(result):
-                result = yield result
             if result is not None:
-                raise TypeError("Expected None, got %r" % result)
+                result = yield result
             if self._prepared_future is not None:
                 # Tell the Application we've finished with prepare()
                 # and are ready for the body to arrive.
@@ -1394,10 +1409,8 @@ class RequestHandler(object):
 
             method = getattr(self, self.request.method.lower())
             result = method(*self.path_args, **self.path_kwargs)
-            if is_future(result):
-                result = yield result
             if result is not None:
-                raise TypeError("Expected None, got %r" % result)
+                result = yield result
             if self._auto_finish and not self._finished:
                 self.finish()
         except Exception as e:
@@ -1996,8 +2009,8 @@ class _RequestDispatcher(httputil.HTTPMessageDelegate):
         # except handler, and we cannot easily access the IOLoop here to
         # call add_future (because of the requirement to remain compatible
         # with WSGI)
-        f = self.handler._execute(transforms, *self.path_args,
-                                  **self.path_kwargs)
+        self.handler._execute(transforms, *self.path_args,
+                              **self.path_kwargs)
         # If we are streaming the request body, then execute() is finished
         # when the handler has prepared to receive the body.  If not,
         # it doesn't matter when execute() finishes (so we return None)
@@ -2131,6 +2144,11 @@ class StaticFileHandler(RequestHandler):
     the ``path`` argument to the get() method (different than the constructor
     argument above); see `URLSpec` for details.
 
+    To serve a file like ``index.html`` automatically when a directory is
+    requested, set ``static_handler_args=dict(default_filename="index.html")``
+    in your application settings, or add ``default_filename`` as an initializer
+    argument for your ``StaticFileHandler``.
+
     To maximize the effectiveness of browser caching, this class supports
     versioned urls (by default using the argument ``?v=``).  If a version
     is given, we instruct the browser to cache this file indefinitely.
@@ -2142,8 +2160,7 @@ class StaticFileHandler(RequestHandler):
     a dedicated static file server (such as nginx or Apache).  We support
     the HTTP ``Accept-Ranges`` mechanism to return partial content (because
     some browsers require this functionality to be present to seek in
-    HTML5 audio or video), but this handler should not be used with
-    files that are too large to fit comfortably in memory.
+    HTML5 audio or video).
 
     **Subclassing notes**
 
@@ -2359,9 +2376,13 @@ class StaticFileHandler(RequestHandler):
 
         .. versionadded:: 3.1
         """
-        root = os.path.abspath(root)
-        # os.path.abspath strips a trailing /
-        # it needs to be temporarily added back for requests to root/
+        # os.path.abspath strips a trailing /.
+        # We must add it back to `root` so that we only match files
+        # in a directory named `root` instead of files starting with
+        # that prefix.
+        root = os.path.abspath(root) + os.path.sep
+        # The trailing slash also needs to be temporarily added back
+        # the requested path so a request to root/ will match.
         if not (absolute_path + os.path.sep).startswith(root):
             raise HTTPError(403, "%s is not in root static directory",
                             self.path)
@@ -2473,7 +2494,19 @@ class StaticFileHandler(RequestHandler):
         .. versionadded:: 3.1
         """
         mime_type, encoding = mimetypes.guess_type(self.absolute_path)
-        return mime_type
+        # per RFC 6713, use the appropriate type for a gzip compressed file
+        if encoding == "gzip":
+            return "application/gzip"
+        # As of 2015-07-21 there is no bzip2 encoding defined at
+        # http://www.iana.org/assignments/media-types/media-types.xhtml
+        # So for that (and any other encoding), use octet-stream.
+        elif encoding is not None:
+            return "application/octet-stream"
+        elif mime_type is not None:
+            return mime_type
+        # if mime_type not detected, use application/octet-stream
+        else:
+            return "application/octet-stream"
 
     def set_extra_headers(self, path):
         """For subclass to add extra headers to the response"""
@@ -2624,7 +2657,16 @@ class GZipContentEncoding(OutputTransform):
     CONTENT_TYPES = set(["application/javascript", "application/x-javascript",
                          "application/xml", "application/atom+xml",
                          "application/json", "application/xhtml+xml"])
-    MIN_LENGTH = 5
+    # Python's GzipFile defaults to level 9, while most other gzip
+    # tools (including gzip itself) default to 6, which is probably a
+    # better CPU/size tradeoff.
+    GZIP_LEVEL = 6
+    # Responses that are too short are unlikely to benefit from gzipping
+    # after considering the "Content-Encoding: gzip" header and the header
+    # inside the gzip encoding.
+    # Note that responses written in multiple chunks will be compressed
+    # regardless of size.
+    MIN_LENGTH = 1024
 
     def __init__(self, request):
         self._gzipping = "gzip" in request.headers.get("Accept-Encoding", "")
@@ -2645,7 +2687,8 @@ class GZipContentEncoding(OutputTransform):
         if self._gzipping:
             headers["Content-Encoding"] = "gzip"
             self._gzip_value = BytesIO()
-            self._gzip_file = gzip.GzipFile(mode="w", fileobj=self._gzip_value)
+            self._gzip_file = gzip.GzipFile(mode="w", fileobj=self._gzip_value,
+                                            compresslevel=self.GZIP_LEVEL)
             chunk = self.transform_chunk(chunk, finishing)
             if "Content-Length" in headers:
                 # The original content length is no longer correct.
@@ -2961,11 +3004,13 @@ else:
         return result == 0
 
 
-def create_signed_value(secret, name, value, version=None, clock=None):
+def create_signed_value(secret, name, value, version=None, clock=None,
+                        key_version=None):
     if version is None:
         version = DEFAULT_SIGNED_VALUE_VERSION
     if clock is None:
         clock = time.time
+
     timestamp = utf8(str(int(clock())))
     value = base64.b64encode(utf8(value))
     if version == 1:
@@ -2982,8 +3027,7 @@ def create_signed_value(secret, name, value, version=None, clock=None):
         #
         # The fields are:
         # - format version (i.e. 2; no length prefix)
-        # - key version (currently 0; reserved for future
-        #       key rotation features)
+        # - key version (integer, default is 0)
         # - timestamp (integer seconds since epoch)
         # - name (not encoded; assumed to be ~alphanumeric)
         # - value (base64-encoded)
@@ -2991,11 +3035,18 @@ def create_signed_value(secret, name, value, version=None, clock=None):
         def format_field(s):
             return utf8("%d:" % len(s)) + utf8(s)
         to_sign = b"|".join([
-            b"2|1:0",
+            b"2",
+            format_field(str(key_version or 0)),
             format_field(timestamp),
             format_field(name),
             format_field(value),
             b''])
+
+        if isinstance(secret, dict):
+            assert key_version is not None, 'Key version must be set when sign key dict is used'
+            assert version >= 2, 'Version must be at least 2 for key version support'
+            secret = secret[key_version]
+
         signature = _create_signature_v2(secret, to_sign)
         return to_sign + signature
     else:
@@ -3006,21 +3057,10 @@ def create_signed_value(secret, name, value, version=None, clock=None):
 _signed_value_version_re = re.compile(br"^([1-9][0-9]*)\|(.*)$")
 
 
-def decode_signed_value(secret, name, value, max_age_days=31,
-                        clock=None, min_version=None):
-    if clock is None:
-        clock = time.time
-    if min_version is None:
-        min_version = DEFAULT_SIGNED_VALUE_MIN_VERSION
-    if min_version > 2:
-        raise ValueError("Unsupported min_version %d" % min_version)
-    if not value:
-        return None
-
-    # Figure out what version this is.  Version 1 did not include an
+def _get_version(value):
+    # Figures out what version value is.  Version 1 did not include an
     # explicit version field and started with arbitrary base64 data,
     # which makes this tricky.
-    value = utf8(value)
     m = _signed_value_version_re.match(value)
     if m is None:
         version = 1
@@ -3037,6 +3077,22 @@ def decode_signed_value(secret, name, value, max_age_days=31,
                 version = 1
         except ValueError:
             version = 1
+    return version
+
+
+def decode_signed_value(secret, name, value, max_age_days=31,
+                        clock=None, min_version=None):
+    if clock is None:
+        clock = time.time
+    if min_version is None:
+        min_version = DEFAULT_SIGNED_VALUE_MIN_VERSION
+    if min_version > 2:
+        raise ValueError("Unsupported min_version %d" % min_version)
+    if not value:
+        return None
+
+    value = utf8(value)
+    version = _get_version(value)
 
     if version < min_version:
         return None
@@ -3080,7 +3136,7 @@ def _decode_signed_value_v1(secret, name, value, max_age_days, clock):
         return None
 
 
-def _decode_signed_value_v2(secret, name, value, max_age_days, clock):
+def _decode_fields_v2(value):
     def _consume_field(s):
         length, _, rest = s.partition(b':')
         n = int(length)
@@ -3091,16 +3147,28 @@ def _decode_signed_value_v2(secret, name, value, max_age_days, clock):
             raise ValueError("malformed v2 signed value field")
         rest = rest[n + 1:]
         return field_value, rest
+
     rest = value[2:]  # remove version number
+    key_version, rest = _consume_field(rest)
+    timestamp, rest = _consume_field(rest)
+    name_field, rest = _consume_field(rest)
+    value_field, passed_sig = _consume_field(rest)
+    return int(key_version), timestamp, name_field, value_field, passed_sig
+
+
+def _decode_signed_value_v2(secret, name, value, max_age_days, clock):
     try:
-        key_version, rest = _consume_field(rest)
-        timestamp, rest = _consume_field(rest)
-        name_field, rest = _consume_field(rest)
-        value_field, rest = _consume_field(rest)
+        key_version, timestamp, name_field, value_field, passed_sig = _decode_fields_v2(value)
     except ValueError:
         return None
-    passed_sig = rest
     signed_string = value[:-len(passed_sig)]
+
+    if isinstance(secret, dict):
+        try:
+            secret = secret[key_version]
+        except KeyError:
+            return None
+
     expected_sig = _create_signature_v2(secret, signed_string)
     if not _time_independent_equals(passed_sig, expected_sig):
         return None
@@ -3114,6 +3182,19 @@ def _decode_signed_value_v2(secret, name, value, max_age_days, clock):
         return base64.b64decode(value_field)
     except Exception:
         return None
+
+
+def get_signature_key_version(value):
+    value = utf8(value)
+    version = _get_version(value)
+    if version < 2:
+        return None
+    try:
+        key_version, _, _, _, _ = _decode_fields_v2(value)
+    except ValueError:
+        return None
+
+    return key_version
 
 
 def _create_signature_v1(secret, *parts):

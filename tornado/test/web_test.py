@@ -11,7 +11,7 @@ from tornado.template import DictLoader
 from tornado.testing import AsyncHTTPTestCase, ExpectLog, gen_test
 from tornado.test.util import unittest
 from tornado.util import u, ObjectDict, unicode_type, timedelta_to_seconds
-from tornado.web import RequestHandler, authenticated, Application, asynchronous, url, HTTPError, StaticFileHandler, _create_signature_v1, create_signed_value, decode_signed_value, ErrorHandler, UIModule, MissingArgumentError, stream_request_body, Finish, removeslash, addslash, RedirectHandler as WebRedirectHandler
+from tornado.web import RequestHandler, authenticated, Application, asynchronous, url, HTTPError, StaticFileHandler, _create_signature_v1, create_signed_value, decode_signed_value, ErrorHandler, UIModule, MissingArgumentError, stream_request_body, Finish, removeslash, addslash, RedirectHandler as WebRedirectHandler, get_signature_key_version, GZipContentEncoding
 
 import binascii
 import contextlib
@@ -71,10 +71,14 @@ class HelloHandler(RequestHandler):
 
 class CookieTestRequestHandler(RequestHandler):
     # stub out enough methods to make the secure_cookie functions work
-    def __init__(self):
+    def __init__(self, cookie_secret='0123456789', key_version=None):
         # don't call super.__init__
         self._cookies = {}
-        self.application = ObjectDict(settings=dict(cookie_secret='0123456789'))
+        if key_version is None:
+            self.application = ObjectDict(settings=dict(cookie_secret=cookie_secret))
+        else:
+            self.application = ObjectDict(settings=dict(cookie_secret=cookie_secret,
+                                                        key_version=key_version))
 
     def get_cookie(self, name):
         return self._cookies.get(name)
@@ -126,6 +130,51 @@ class SecureCookieV1Test(unittest.TestCase):
         handler = CookieTestRequestHandler()
         handler.set_secure_cookie('foo', b'\xe9', version=1)
         self.assertEqual(handler.get_secure_cookie('foo', min_version=1), b'\xe9')
+
+
+# See SignedValueTest below for more.
+class SecureCookieV2Test(unittest.TestCase):
+    KEY_VERSIONS = {
+        0: 'ajklasdf0ojaisdf',
+        1: 'aslkjasaolwkjsdf'
+    }
+
+    def test_round_trip(self):
+        handler = CookieTestRequestHandler()
+        handler.set_secure_cookie('foo', b'bar', version=2)
+        self.assertEqual(handler.get_secure_cookie('foo', min_version=2), b'bar')
+
+    def test_key_version_roundtrip(self):
+        handler = CookieTestRequestHandler(cookie_secret=self.KEY_VERSIONS,
+                                           key_version=0)
+        handler.set_secure_cookie('foo', b'bar')
+        self.assertEqual(handler.get_secure_cookie('foo'), b'bar')
+
+    def test_key_version_roundtrip_differing_version(self):
+        handler = CookieTestRequestHandler(cookie_secret=self.KEY_VERSIONS,
+                                           key_version=1)
+        handler.set_secure_cookie('foo', b'bar')
+        self.assertEqual(handler.get_secure_cookie('foo'), b'bar')
+
+    def test_key_version_increment_version(self):
+        handler = CookieTestRequestHandler(cookie_secret=self.KEY_VERSIONS,
+                                           key_version=0)
+        handler.set_secure_cookie('foo', b'bar')
+        new_handler = CookieTestRequestHandler(cookie_secret=self.KEY_VERSIONS,
+                                               key_version=1)
+        new_handler._cookies = handler._cookies
+        self.assertEqual(new_handler.get_secure_cookie('foo'), b'bar')
+
+    def test_key_version_invalidate_version(self):
+        handler = CookieTestRequestHandler(cookie_secret=self.KEY_VERSIONS,
+                                           key_version=0)
+        handler.set_secure_cookie('foo', b'bar')
+        new_key_versions = self.KEY_VERSIONS.copy()
+        new_key_versions.pop(0)
+        new_handler = CookieTestRequestHandler(cookie_secret=new_key_versions,
+                                               key_version=1)
+        new_handler._cookies = handler._cookies
+        self.assertEqual(new_handler.get_secure_cookie('foo'), None)
 
 
 class CookieTest(WebTestCase):
@@ -929,6 +978,19 @@ class StaticFileTest(WebTestCase):
 
         response = self.fetch('/static/robots.txt')
         self.assertTrue(b"Disallow: /" in response.body)
+        self.assertEqual(response.headers.get("Content-Type"), "text/plain")
+
+    def test_static_compressed_files(self):
+        response = self.fetch("/static/sample.xml.gz")
+        self.assertEqual(response.headers.get("Content-Type"),
+                         "application/gzip")
+        response = self.fetch("/static/sample.xml.bz2")
+        self.assertEqual(response.headers.get("Content-Type"),
+                         "application/octet-stream")
+        # make sure the uncompressed file still has the correct type
+        response = self.fetch("/static/sample.xml")
+        self.assertTrue(response.headers.get("Content-Type")
+                        in set(("text/xml", "application/xml")))
 
     def test_static_url(self):
         response = self.fetch("/static_url/robots.txt")
@@ -1131,6 +1193,15 @@ class StaticFileTest(WebTestCase):
     def test_static_404(self):
         response = self.get_and_head('/static/blarg')
         self.assertEqual(response.code, 404)
+
+    def test_path_traversal_protection(self):
+        with ExpectLog(gen_log, ".*not in root static directory"):
+            response = self.get_and_head('/static/../static_foo.txt')
+        # Attempted path traversal should result in 403, not 200
+        # (which means the check failed and the file was served)
+        # or 404 (which means that the file didn't exist and
+        # is probably a packaging error).
+        self.assertEqual(response.code, 403)
 
 
 @wsgi_safe
@@ -1412,7 +1483,8 @@ class GzipTestCase(SimpleHandlerTestCase):
         def get(self):
             if self.get_argument('vary', None):
                 self.set_header('Vary', self.get_argument('vary'))
-            self.write('hello world')
+            # Must write at least MIN_LENGTH bytes to activate compression.
+            self.write('hello world' + ('!' * GZipContentEncoding.MIN_LENGTH))
 
     def get_app_kwargs(self):
         return dict(
@@ -1489,8 +1561,11 @@ class ClearAllCookiesTest(SimpleHandlerTestCase):
     def test_clear_all_cookies(self):
         response = self.fetch('/', headers={'Cookie': 'foo=bar; baz=xyzzy'})
         set_cookies = sorted(response.headers.get_list('Set-Cookie'))
-        self.assertTrue(set_cookies[0].startswith('baz=;'))
-        self.assertTrue(set_cookies[1].startswith('foo=;'))
+        # Python 3.5 sends 'baz="";'; older versions use 'baz=;'
+        self.assertTrue(set_cookies[0].startswith('baz=;') or
+                        set_cookies[0].startswith('baz="";'))
+        self.assertTrue(set_cookies[1].startswith('foo=;') or
+                        set_cookies[1].startswith('foo="";'))
 
 
 class PermissionError(Exception):
@@ -2147,6 +2222,7 @@ class ClientCloseTest(SimpleHandlerTestCase):
 
 class SignedValueTest(unittest.TestCase):
     SECRET = "It's a secret to everybody"
+    SECRET_DICT = {0: "asdfbasdf", 1: "12312312", 2: "2342342"}
 
     def past(self):
         return self.present() - 86400 * 32
@@ -2252,6 +2328,43 @@ class SignedValueTest(unittest.TestCase):
         decoded = decode_signed_value(SignedValueTest.SECRET, "key", signed,
                                       clock=self.present)
         self.assertEqual(value, decoded)
+
+    def test_key_versioning_read_write_default_key(self):
+        value = b"\xe9"
+        signed = create_signed_value(SignedValueTest.SECRET_DICT,
+                                     "key", value, clock=self.present,
+                                     key_version=0)
+        decoded = decode_signed_value(SignedValueTest.SECRET_DICT,
+                                      "key", signed, clock=self.present)
+        self.assertEqual(value, decoded)
+
+    def test_key_versioning_read_write_non_default_key(self):
+        value = b"\xe9"
+        signed = create_signed_value(SignedValueTest.SECRET_DICT,
+                                     "key", value, clock=self.present,
+                                     key_version=1)
+        decoded = decode_signed_value(SignedValueTest.SECRET_DICT,
+                                      "key", signed, clock=self.present)
+        self.assertEqual(value, decoded)
+
+    def test_key_versioning_invalid_key(self):
+        value = b"\xe9"
+        signed = create_signed_value(SignedValueTest.SECRET_DICT,
+                                     "key", value, clock=self.present,
+                                     key_version=0)
+        newkeys = SignedValueTest.SECRET_DICT.copy()
+        newkeys.pop(0)
+        decoded = decode_signed_value(newkeys,
+                                      "key", signed, clock=self.present)
+        self.assertEqual(None, decoded)
+
+    def test_key_version_retrieval(self):
+        value = b"\xe9"
+        signed = create_signed_value(SignedValueTest.SECRET_DICT,
+                                     "key", value, clock=self.present,
+                                     key_version=1)
+        key_version = get_signature_key_version(signed)
+        self.assertEqual(1, key_version)
 
 
 @wsgi_safe

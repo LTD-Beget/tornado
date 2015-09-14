@@ -249,7 +249,7 @@ class IOLoop(Configurable):
             if IOLoop.current(instance=False) is None:
                 self.make_current()
         elif make_current:
-            if IOLoop.current(instance=False) is None:
+            if IOLoop.current(instance=False) is not None:
                 raise RuntimeError("current IOLoop already exists")
             self.make_current()
 
@@ -766,8 +766,10 @@ class PollIOLoop(IOLoop):
                     # IOLoop is just started once at the beginning.
                     signal.set_wakeup_fd(old_wakeup_fd)
                     old_wakeup_fd = None
-            except ValueError:  # non-main thread
-                pass
+            except ValueError:
+                # Non-main thread, or the previous value of wakeup_fd
+                # is no longer valid.
+                old_wakeup_fd = None
 
         try:
             while True:

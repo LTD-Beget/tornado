@@ -44,10 +44,81 @@ def _set_timeout(future, timeout):
             lambda _: io_loop.remove_timeout(timeout_handle))
 
 
+class _QueueIterator(object):
+    def __init__(self, q):
+        self.q = q
+
+    def __anext__(self):
+        return self.q.get()
+
+
 class Queue(object):
     """Coordinate producer and consumer coroutines.
 
     If maxsize is 0 (the default) the queue size is unbounded.
+
+    .. testcode::
+
+        from tornado import gen
+        from tornado.ioloop import IOLoop
+        from tornado.queues import Queue
+
+        q = Queue(maxsize=2)
+
+        @gen.coroutine
+        def consumer():
+            while True:
+                item = yield q.get()
+                try:
+                    print('Doing work on %s' % item)
+                    yield gen.sleep(0.01)
+                finally:
+                    q.task_done()
+
+        @gen.coroutine
+        def producer():
+            for item in range(5):
+                yield q.put(item)
+                print('Put %s' % item)
+
+        @gen.coroutine
+        def main():
+            # Start consumer without waiting (since it never finishes).
+            IOLoop.current().spawn_callback(consumer)
+            yield producer()     # Wait for producer to put all tasks.
+            yield q.join()       # Wait for consumer to finish all tasks.
+            print('Done')
+
+        IOLoop.current().run_sync(main)
+
+    .. testoutput::
+
+        Put 0
+        Put 1
+        Doing work on 0
+        Put 2
+        Doing work on 1
+        Put 3
+        Doing work on 2
+        Put 4
+        Doing work on 3
+        Doing work on 4
+        Done
+
+    In Python 3.5, `Queue` implements the async iterator protocol, so
+    ``consumer()`` could be rewritten as::
+
+        async def consumer():
+            async for item in q:
+                try:
+                    print('Doing work on %s' % item)
+                    yield gen.sleep(0.01)
+                finally:
+                    q.task_done()
+
+    .. versionchanged:: 4.3
+       Added ``async for`` support in Python 3.5.
+
     """
     def __init__(self, maxsize=0):
         if maxsize is None:
@@ -172,6 +243,10 @@ class Queue(object):
         """
         return self._finished.wait(timeout)
 
+    @gen.coroutine
+    def __aiter__(self):
+        return _QueueIterator(self)
+
     # These three are overridable in subclasses.
     def _init(self):
         self._queue = collections.deque()
@@ -220,6 +295,25 @@ class PriorityQueue(Queue):
     """A `.Queue` that retrieves entries in priority order, lowest first.
 
     Entries are typically tuples like ``(priority number, data)``.
+
+    .. testcode::
+
+        from tornado.queues import PriorityQueue
+
+        q = PriorityQueue()
+        q.put((1, 'medium-priority item'))
+        q.put((0, 'high-priority item'))
+        q.put((10, 'low-priority item'))
+
+        print(q.get_nowait())
+        print(q.get_nowait())
+        print(q.get_nowait())
+
+    .. testoutput::
+
+        (0, 'high-priority item')
+        (1, 'medium-priority item')
+        (10, 'low-priority item')
     """
     def _init(self):
         self._queue = []
@@ -232,7 +326,27 @@ class PriorityQueue(Queue):
 
 
 class LifoQueue(Queue):
-    """A `.Queue` that retrieves the most recently put items first."""
+    """A `.Queue` that retrieves the most recently put items first.
+
+    .. testcode::
+
+        from tornado.queues import LifoQueue
+
+        q = LifoQueue()
+        q.put(3)
+        q.put(2)
+        q.put(1)
+
+        print(q.get_nowait())
+        print(q.get_nowait())
+        print(q.get_nowait())
+
+    .. testoutput::
+
+        1
+        2
+        3
+    """
     def _init(self):
         self._queue = []
 

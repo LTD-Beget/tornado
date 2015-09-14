@@ -99,7 +99,7 @@ http://api.mongodb.org/python/current/installation.html#osx
 
 kwargs = {}
 
-version = "4.4"
+version = "4.3.dev1"
 
 with open('README.rst') as f:
     kwargs['long_description'] = f.read()
@@ -146,7 +146,11 @@ setup(
             "gettext_translations/fr_FR/LC_MESSAGES/tornado_test.po",
             "options_test.cfg",
             "static/robots.txt",
+            "static/sample.xml",
+            "static/sample.xml.gz",
+            "static/sample.xml.bz2",
             "static/dir/index.html",
+            "static_foo.txt",
             "templates/utf8.html",
             "test.crt",
             "test.key",

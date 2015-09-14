@@ -205,6 +205,7 @@ class SimpleHTTPClientTestMixin(object):
         self.assertEqual(response.headers["Content-Encoding"], "gzip")
         self.assertNotEqual(response.body, b"asdfqwer")
         # Our test data gets bigger when gzipped.  Oops.  :)
+        # Chunked encoding bypasses the MIN_LENGTH check.
         self.assertEqual(len(response.body), 34)
         f = gzip.GzipFile(mode="r", fileobj=response.buffer)
         self.assertEqual(f.read(), b"asdfqwer")
@@ -463,6 +464,16 @@ class SimpleHTTPSClientTestCase(SimpleHTTPClientTestMixin, AsyncHTTPSTestCase):
             resp = self.fetch("/hello", ssl_options=ctx)
         self.assertRaises(ssl.SSLError, resp.rethrow)
 
+    def test_error_logging(self):
+        # No stack traces are logged for SSL errors (in this case,
+        # failure to validate the testing self-signed cert).
+        # The SSLError is exposed through ssl.SSLError.
+        with ExpectLog(gen_log, '.*') as expect_log:
+            response = self.fetch("/", validate_cert=True)
+            self.assertEqual(response.code, 599)
+            self.assertIsInstance(response.error, ssl.SSLError)
+        self.assertFalse(expect_log.logged_stack)
+
 
 class CreateAsyncHTTPClientTestCase(AsyncTestCase):
     def setUp(self):
@@ -631,3 +642,49 @@ class MaxHeaderSizeTest(AsyncHTTPTestCase):
         with ExpectLog(gen_log, "Unsatisfiable read"):
             response = self.fetch('/large')
         self.assertEqual(response.code, 599)
+
+
+class MaxBodySizeTest(AsyncHTTPTestCase):
+    def get_app(self):
+        class SmallBody(RequestHandler):
+            def get(self):
+                self.write("a"*1024*64)
+
+        class LargeBody(RequestHandler):
+            def get(self):
+                self.write("a"*1024*100)
+
+        return Application([('/small', SmallBody),
+                            ('/large', LargeBody)])
+
+    def get_http_client(self):
+        return SimpleAsyncHTTPClient(io_loop=self.io_loop, max_body_size=1024*64)
+
+    def test_small_body(self):
+        response = self.fetch('/small')
+        response.rethrow()
+        self.assertEqual(response.body, b'a'*1024*64)
+
+    def test_large_body(self):
+        with ExpectLog(gen_log, "Malformed HTTP message from None: Content-Length too long"):
+            response = self.fetch('/large')
+        self.assertEqual(response.code, 599)
+
+
+class MaxBufferSizeTest(AsyncHTTPTestCase):
+    def get_app(self):
+
+        class LargeBody(RequestHandler):
+            def get(self):
+                self.write("a"*1024*100)
+
+        return Application([('/large', LargeBody)])
+
+    def get_http_client(self):
+        # 100KB body with 64KB buffer
+        return SimpleAsyncHTTPClient(io_loop=self.io_loop, max_body_size=1024*100, max_buffer_size=1024*64)
+
+    def test_large_body(self):
+        response = self.fetch('/large')
+        response.rethrow()
+        self.assertEqual(response.body, b'a'*1024*100)

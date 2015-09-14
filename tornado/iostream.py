@@ -89,8 +89,16 @@ class StreamClosedError(IOError):
     Note that the close callback is scheduled to run *after* other
     callbacks on the stream (to allow for buffered data to be processed),
     so you may see this error before you see the close callback.
+
+    The ``real_error`` attribute contains the underlying error that caused
+    the stream to close (if any).
+
+    .. versionchanged:: 4.3
+       Added the ``real_error`` attribute.
     """
-    pass
+    def __init__(self, real_error=None):
+        super(StreamClosedError, self).__init__('Stream is closed')
+        self.real_error = real_error
 
 
 class UnsatisfiableReadError(Exception):
@@ -344,7 +352,8 @@ class BaseIOStream(object):
         try:
             self._try_inline_read()
         except:
-            future.add_done_callback(lambda f: f.exception())
+            if future is not None:
+                future.add_done_callback(lambda f: f.exception())
             raise
         return future
 
@@ -446,13 +455,7 @@ class BaseIOStream(object):
                 futures.append(self._ssl_connect_future)
                 self._ssl_connect_future = None
             for future in futures:
-                if self._is_connreset(self.error):
-                    # Treat connection resets as closed connections so
-                    # clients only have to catch one kind of exception
-                    # to avoid logging.
-                    future.set_exception(StreamClosedError())
-                else:
-                    future.set_exception(self.error or StreamClosedError())
+                future.set_exception(StreamClosedError(real_error=self.error))
             if self._close_callback is not None:
                 cb = self._close_callback
                 self._close_callback = None
@@ -644,8 +647,8 @@ class BaseIOStream(object):
             pos = self._read_to_buffer_loop()
         except UnsatisfiableReadError:
             raise
-        except Exception:
-            gen_log.warning("error on read", exc_info=True)
+        except Exception as e:
+            gen_log.warning("error on read: %s" % e)
             self.close(exc_info=True)
             return
         if pos is not None:
@@ -841,12 +844,8 @@ class BaseIOStream(object):
                     break
                 self._write_buffer_frozen = False
                 _merge_prefix(self._write_buffer, num_bytes)
-                if self._write_buffer is not None:
-                    self._write_buffer.popleft()
-                    self._write_buffer_size -= num_bytes
-                else:
-                    self._write_buffer_frozen = True
-                    break
+                self._write_buffer.popleft()
+                self._write_buffer_size -= num_bytes
             except (socket.error, IOError, OSError) as e:
                 if e.args[0] in _ERRNO_WOULDBLOCK:
                     self._write_buffer_frozen = True
@@ -879,7 +878,7 @@ class BaseIOStream(object):
 
     def _check_closed(self):
         if self.closed():
-            raise StreamClosedError("Stream is closed")
+            raise StreamClosedError(real_error=self.error)
 
     def _maybe_add_error_listener(self):
         # This method is part of an optimization: to detect a connection that
@@ -1152,6 +1151,15 @@ class IOStream(BaseIOStream):
 
         def close_callback():
             if not future.done():
+                # Note that unlike most Futures returned by IOStream,
+                # this one passes the underlying error through directly
+                # instead of wrapping everything in a StreamClosedError
+                # with a real_error attribute. This is because once the
+                # connection is established it's more helpful to raise
+                # the SSLError directly than to hide it behind a
+                # StreamClosedError (and the client is expecting SSL
+                # issues rather than network issues since this method is
+                # named start_tls).
                 future.set_exception(ssl_stream.error or StreamClosedError())
             if orig_close_callback is not None:
                 orig_close_callback()
@@ -1190,12 +1198,12 @@ class IOStream(BaseIOStream):
             try:
                 self.socket.setsockopt(socket.IPPROTO_TCP,
                                        socket.TCP_NODELAY, 1 if value else 0)
-            except Exception as e:
+            except socket.error as e:
                 # Sometimes setsockopt will fail if the socket is closed
                 # at the wrong time.  This can happen with HTTPServer
                 # resetting the value to false between requests.
                 if e.errno != errno.EINVAL and not self._is_connreset(e):
-                    pass # raise
+                    raise
 
 
 class SSLIOStream(IOStream):
@@ -1315,8 +1323,8 @@ class SSLIOStream(IOStream):
             return False
         try:
             ssl_match_hostname(peercert, self._server_hostname)
-        except SSLCertificateError:
-            gen_log.warning("Invalid SSL certificate", exc_info=True)
+        except SSLCertificateError as e:
+            gen_log.warning("Invalid SSL certificate: %s" % e)
             return False
         else:
             return True
@@ -1512,8 +1520,6 @@ def _merge_prefix(deque, size):
     >>> _merge_prefix(d, 100); print(d)
     deque(['abcdefghij'])
     """
-    if deque is None or deque[0] is None:
-        return
     if len(deque) == 1 and len(deque[0]) <= size:
         return
     prefix = []

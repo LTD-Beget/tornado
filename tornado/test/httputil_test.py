@@ -9,13 +9,14 @@ from tornado.testing import ExpectLog
 from tornado.test.util import unittest
 from tornado.util import u
 
+import copy
 import datetime
 import logging
+import pickle
 import time
 
 
 class TestUrlConcat(unittest.TestCase):
-
     def test_url_concat_no_query_params(self):
         url = url_concat(
             "https://localhost/path",
@@ -280,6 +281,43 @@ Foo: even
                           ('Lf', 'lf'),
                           ])
 
+    def test_copy(self):
+        all_pairs = [('A', '1'), ('A', '2'), ('B', 'c')]
+        h1 = HTTPHeaders()
+        for k, v in all_pairs:
+            h1.add(k, v)
+        h2 = h1.copy()
+        h3 = copy.copy(h1)
+        h4 = copy.deepcopy(h1)
+        for headers in [h1, h2, h3, h4]:
+            # All the copies are identical, no matter how they were
+            # constructed.
+            self.assertEqual(list(sorted(headers.get_all())), all_pairs)
+        for headers in [h2, h3, h4]:
+            # Neither the dict or its member lists are reused.
+            self.assertIsNot(headers, h1)
+            self.assertIsNot(headers.get_list('A'), h1.get_list('A'))
+
+    def test_pickle_roundtrip(self):
+        headers = HTTPHeaders()
+        headers.add('Set-Cookie', 'a=b')
+        headers.add('Set-Cookie', 'c=d')
+        headers.add('Content-Type', 'text/html')
+        pickled = pickle.dumps(headers)
+        unpickled = pickle.loads(pickled)
+        self.assertEqual(sorted(headers.get_all()), sorted(unpickled.get_all()))
+        self.assertEqual(sorted(headers.items()), sorted(unpickled.items()))
+
+    def test_setdefault(self):
+        headers = HTTPHeaders()
+        headers['foo'] = 'bar'
+        # If a value is present, setdefault returns it without changes.
+        self.assertEqual(headers.setdefault('foo', 'baz'), 'bar')
+        self.assertEqual(headers['foo'], 'bar')
+        # If a value is not present, setdefault sets it for future use.
+        self.assertEqual(headers.setdefault('quux', 'xyzzy'), 'xyzzy')
+        self.assertEqual(headers['quux'], 'xyzzy')
+        self.assertEqual(sorted(headers.get_all()), [('Foo', 'bar'), ('Quux', 'xyzzy')])
 
 class FormatTimestampTest(unittest.TestCase):
     # Make sure that all the input types are supported.

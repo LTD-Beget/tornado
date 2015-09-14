@@ -593,6 +593,14 @@ if have_twisted:
         ],
         'twisted.internet.test.test_unix.UNIXPortTestsBuilder': [],
     }
+    if sys.version_info >= (3,):
+        # In Twisted 15.2.0 on Python 3.4, the process tests will try to run
+        # but fail, due in part to interactions between Tornado's strict
+        # warnings-as-errors policy and Twisted's own warning handling
+        # (it was not obvious how to configure the warnings module to
+        # reconcile the two), and partly due to what looks like a packaging
+        # error (process_cli.py missing). For now, just skip it.
+        del twisted_tests['twisted.internet.test.test_process.ProcessTestsBuilder']
     for test_name, blacklist in twisted_tests.items():
         try:
             test_class = import_object(test_name)
@@ -621,6 +629,24 @@ if have_twisted:
                     super(TornadoTest, self).tearDown()
                     os.chdir(self.__curdir)
                     shutil.rmtree(self.__tempdir)
+
+                def flushWarnings(self, *args, **kwargs):
+                    # This is a hack because Twisted and Tornado have
+                    # differing approaches to warnings in tests.
+                    # Tornado sets up a global set of warnings filters
+                    # in runtests.py, while Twisted patches the filter
+                    # list in each test. The net effect is that
+                    # Twisted's tests run with Tornado's increased
+                    # strictness (BytesWarning and ResourceWarning are
+                    # enabled) but without our filter rules to ignore those
+                    # warnings from Twisted code.
+                    filtered = []
+                    for w in super(TornadoTest, self).flushWarnings(
+                            *args, **kwargs):
+                        if w['category'] in (BytesWarning, ResourceWarning):
+                            continue
+                        filtered.append(w)
+                    return filtered
 
                 def buildReactor(self):
                     self.__saved_signals = save_signal_handlers()
@@ -659,13 +685,13 @@ if have_twisted:
         correctly.  In some tests another TornadoReactor is layered on top
         of the whole stack.
         """
-        def initialize(self):
+        def initialize(self, **kwargs):
             # When configured to use LayeredTwistedIOLoop we can't easily
             # get the next-best IOLoop implementation, so use the lowest common
             # denominator.
             self.real_io_loop = SelectIOLoop()
             reactor = TornadoReactor(io_loop=self.real_io_loop)
-            super(LayeredTwistedIOLoop, self).initialize(reactor=reactor)
+            super(LayeredTwistedIOLoop, self).initialize(reactor=reactor, **kwargs)
             self.add_callback(self.make_current)
 
         def close(self, all_fds=False):

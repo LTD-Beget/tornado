@@ -5,10 +5,11 @@
 
 
 from __future__ import absolute_import, division, print_function, with_statement
-from tornado.auth import OpenIdMixin, OAuthMixin, OAuth2Mixin, TwitterMixin, AuthError
+from tornado.auth import OpenIdMixin, OAuthMixin, OAuth2Mixin, TwitterMixin, AuthError, GoogleOAuth2Mixin
 from tornado.concurrent import Future
 from tornado.escape import json_decode
 from tornado import gen
+from tornado.httputil import url_concat
 from tornado.log import gen_log
 from tornado.testing import AsyncHTTPTestCase, ExpectLog
 from tornado.util import u
@@ -413,3 +414,87 @@ class AuthTest(AsyncHTTPTestCase):
         response = self.fetch('/twitter/client/show_user_future?name=error')
         self.assertEqual(response.code, 500)
         self.assertIn(b'Error response HTTP 500', response.body)
+
+
+class GoogleLoginHandler(RequestHandler, GoogleOAuth2Mixin):
+    def initialize(self, test):
+        self.test = test
+        self._OAUTH_REDIRECT_URI = test.get_url('/client/login')
+        self._OAUTH_AUTHORIZE_URL = test.get_url('/google/oauth2/authorize')
+        self._OAUTH_ACCESS_TOKEN_URL = test.get_url('/google/oauth2/token')
+
+    @gen.coroutine
+    def get(self):
+        code = self.get_argument('code', None)
+        if code is not None:
+            # retrieve authenticate google user
+            access = yield self.get_authenticated_user(self._OAUTH_REDIRECT_URI,
+                                                       code)
+            user = yield self.oauth2_request(
+                self.test.get_url("/google/oauth2/userinfo"),
+                access_token=access["access_token"])
+            # return the user and access token as json
+            user["access_token"] = access["access_token"]
+            self.write(user)
+        else:
+            yield self.authorize_redirect(
+                redirect_uri=self._OAUTH_REDIRECT_URI,
+                client_id=self.settings['google_oauth']['key'],
+                client_secret=self.settings['google_oauth']['secret'],
+                scope=['profile', 'email'],
+                response_type='code',
+                extra_params={'prompt': 'select_account'})
+
+
+class GoogleOAuth2AuthorizeHandler(RequestHandler):
+    def get(self):
+        # issue a fake auth code and redirect to redirect_uri
+        code = 'fake-authorization-code'
+        self.redirect(url_concat(self.get_argument('redirect_uri'),
+                                 dict(code=code)))
+
+
+class GoogleOAuth2TokenHandler(RequestHandler):
+    def post(self):
+        assert self.get_argument('code') == 'fake-authorization-code'
+        # issue a fake token
+        self.finish({
+            'access_token': 'fake-access-token',
+            'expires_in': 'never-expires'
+        })
+
+
+class GoogleOAuth2UserinfoHandler(RequestHandler):
+    def get(self):
+        assert self.get_argument('access_token') == 'fake-access-token'
+        # return a fake user
+        self.finish({
+                'name': 'Foo',
+                'email': 'foo@example.com'
+                })
+
+
+class GoogleOAuth2Test(AsyncHTTPTestCase):
+    def get_app(self):
+        return Application(
+            [
+                # test endpoints
+                ('/client/login', GoogleLoginHandler, dict(test=self)),
+
+                # simulated google authorization server endpoints
+                ('/google/oauth2/authorize', GoogleOAuth2AuthorizeHandler),
+                ('/google/oauth2/token', GoogleOAuth2TokenHandler),
+                ('/google/oauth2/userinfo', GoogleOAuth2UserinfoHandler),
+            ],
+            google_oauth={
+                "key": 'fake_google_client_id',
+                "secret": 'fake_google_client_secret'
+            })
+
+    def test_google_login(self):
+        response = self.fetch('/client/login')
+        self.assertDictEqual({
+            u('name'): u('Foo'),
+            u('email'): u('foo@example.com'),
+            u('access_token'): u('fake-access-token'),
+        }, json_decode(response.body))

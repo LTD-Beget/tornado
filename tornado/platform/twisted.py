@@ -416,13 +416,13 @@ class TwistedIOLoop(tornado.ioloop.IOLoop):
     because the ``SIGCHLD`` handlers used by Tornado and Twisted conflict
     with each other.
     """
-    def initialize(self, reactor=None):
+    def initialize(self, reactor=None, **kwargs):
+        super(TwistedIOLoop, self).initialize(**kwargs)
         if reactor is None:
             import twisted.internet.reactor
             reactor = twisted.internet.reactor
         self.reactor = reactor
         self.fds = {}
-        self.reactor.callWhenRunning(self.make_current)
 
     def close(self, all_fds=False):
         fds = self.fds
@@ -476,8 +476,16 @@ class TwistedIOLoop(tornado.ioloop.IOLoop):
         del self.fds[fd]
 
     def start(self):
-        self._setup_logging()
-        self.reactor.run()
+        old_current = IOLoop.current(instance=False)
+        try:
+            self._setup_logging()
+            self.make_current()
+            self.reactor.run()
+        finally:
+            if old_current is None:
+                IOLoop.clear_current()
+            else:
+                old_current.make_current()
 
     def stop(self):
         self.reactor.crash()
