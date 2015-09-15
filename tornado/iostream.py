@@ -844,7 +844,11 @@ class BaseIOStream(object):
                     break
                 self._write_buffer_frozen = False
                 _merge_prefix(self._write_buffer, num_bytes)
-                self._write_buffer.popleft()
+                try:
+                    self._write_buffer.popleft()
+                except AttributeError:
+                    if self._write_buffer is None:
+                        break
                 self._write_buffer_size -= num_bytes
             except (socket.error, IOError, OSError) as e:
                 if e.args[0] in _ERRNO_WOULDBLOCK:
