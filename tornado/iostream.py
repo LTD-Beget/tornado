@@ -1203,7 +1203,9 @@ class IOStream(BaseIOStream):
                 # at the wrong time.  This can happen with HTTPServer
                 # resetting the value to false between requests.
                 if e.errno != errno.EINVAL and not self._is_connreset(e):
-                    raise
+                    pass
+                else:
+                    pass
 
 
 class SSLIOStream(IOStream):
